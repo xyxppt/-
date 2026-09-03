@@ -6,23 +6,22 @@ import requests
 AUTH_TOKEN_URL = "https://oshcard.osha.gov.tw/osc/api/public/applyOnline/authToken"
 TRAINING_LIST_URL = "https://oshcard.osha.gov.tw/osc/api/public/applyOnline/getTrainingList"
 
-# 2. 從環境變數讀取 LINE Messaging API 的秘密金鑰 (Secrets)
+# 2. 從環境變數讀取 LINE Messaging API 的 Channel Access Token
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_USER_ID = os.getenv("LINE_USER_ID")  # 你的 LINE User ID (例如: Uc1234567890abcdef...)
 
-def send_line_message(text_message):
-    """使用 LINE Messaging API 推播訊息 (Push Message)"""
-    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
-        print("未設定 LINE Token 或 User ID，跳過 LINE 通知。")
+def broadcast_line_message(text_message):
+    """使用 LINE Messaging API 的 Broadcast (廣播/群發) 功能，發送訊息給所有好友"""
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("未設定 LINE Token，跳過 LINE 通知。")
         return
 
-    url = "https://api.line.me/v2/bot/message/push"
+    # 改用 /v2/bot/message/broadcast 廣播 API
+    url = "https://api.line.me/v2/bot/message/broadcast"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
     }
     payload = {
-        "to": LINE_USER_ID,
         "messages": [
             {
                 "type": "text",
@@ -33,9 +32,9 @@ def send_line_message(text_message):
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=10)
         if res.status_code == 200:
-            print("LINE 訊息推播成功！")
+            print("LINE 廣播推播成功（已發送給所有好友）！")
         else:
-            print(f"LINE 訊息發送失敗，HTTP 狀態碼: {res.status_code}, 回應: {res.text}")
+            print(f"LINE 廣播發送失敗，HTTP 狀態碼: {res.status_code}, 回應: {res.text}")
     except Exception as e:
         print(f"發送 LINE 訊息時發生例外錯誤: {e}")
 
@@ -84,7 +83,7 @@ def check_training_courses():
                     item["remaining"] = remaining
                     available_courses.append(item)
 
-            # 3. 發送 LINE 通知
+            # 3. 發送 LINE 廣播通知
             if available_courses:
                 msg = f"🚨【臺灣職安卡】發現 {len(available_courses)} 門課程尚有名額！\n\n"
                 for c in available_courses:
@@ -95,7 +94,7 @@ def check_training_courses():
                     msg += "------------------------------\n"
                 
                 msg += "\n🔗 點此前往報名：https://oshcard.osha.gov.tw/oscVue/OnlineApply/applylist"
-                send_line_message(msg)
+                broadcast_line_message(msg)
             else:
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 檢查完成：目前所有課程皆已額滿。")
 
