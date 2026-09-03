@@ -78,7 +78,7 @@ def check_training_courses():
                 signed_up = item.get("numberOfPeopleSignUp", 0)
 
                 # 判斷：已報名人數低於總容納人數
-                if signed_up < total_capacity:
+                if True:
                     remaining = total_capacity - signed_up
                     item["remaining"] = remaining
                     available_courses.append(item)
