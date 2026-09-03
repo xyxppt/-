@@ -2,10 +2,7 @@ name: Check OSHCard Courses
 
 on:
   schedule:
-    # 這裡的設定為每 30 分鐘自動執行一次 (Cron 語法)
-    # 格式：分 時 日 月 星期 (使用 UTC 時間)
     - cron: '*/30 * * * *'
-  # 支援在 GitHub 網頁上手動點擊觸發測試
   workflow_dispatch:
 
 jobs:
@@ -28,8 +25,6 @@ jobs:
 
     - name: Run script
       env:
-        # 將 GitHub Secrets 帶入環境變數中
         LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-        LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
       run: |
         python check_oshcard.py
