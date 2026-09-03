@@ -2,7 +2,7 @@ import os
 import time
 import requests
 
-# 1. API 網址設定
+# 1. API 網址設定（修復 404 錯誤）
 AUTH_TOKEN_URL = "https://oshcard.osha.gov.tw/osc/api/public/applyOnline/authToken"
 TRAINING_LIST_URL = "https://oshcard.osha.gov.tw/osc/api/public/applyOnline/getTrainingList"
 
