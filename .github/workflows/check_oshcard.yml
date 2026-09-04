@@ -8,6 +8,8 @@ on:
 jobs:
   check-job:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 授權 Actions 寫入 Git 記憶檔
 
     steps:
       - name: Check out repository
@@ -29,3 +31,10 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python check_oshcard.py
+
+      - name: Save memory state (Auto Commit)
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add seen_courses.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto update seen courses memory" && git push)
