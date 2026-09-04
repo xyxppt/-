@@ -3,13 +3,13 @@ name: Check OSH Card
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '17,47 * * * *' # 避開整點半點，改成每小時的 17 分與 47 分執行
 
 jobs:
   check-job:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 授權 Actions 寫入 Git 記憶檔
+      contents: write
 
     steps:
       - name: Check out repository
