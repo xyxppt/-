@@ -12,6 +12,8 @@ AUTH_TOKEN_URL = "https://oshcard.osha.gov.tw/OSC/api/authToken"
 TRAINING_LIST_URL = "https://oshcard.osha.gov.tw/OSC/api/public/applyOnline/getTrainingList"
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+# 讀取觸發事件名稱 (workflow_dispatch 代表手動點擊, schedule 代表背景排程)
+GITHUB_EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "manual")
 
 def broadcast_line_message(text_message):
     """發送 LINE 廣播"""
@@ -55,7 +57,7 @@ def check_training_courses():
     })
 
     try:
-        # 1. Session & Auth Token
+        # 1. 建立 Session 並取得 Auth Token
         session.get(MAIN_PAGE_URL, timeout=10)
         auth_res = session.post(
             AUTH_TOKEN_URL, 
@@ -80,21 +82,15 @@ def check_training_courses():
             today_str = datetime.now().strftime("%Y/%m/%d")
             available_courses = []
 
-            print("\n🔍 --- 課程解析診斷資訊 ---", flush=True)
-            for idx, item in enumerate(training_list, 1):
-                # 正確修正對調：numberOfPeopleSignUp 為總名額，numberOfPeople 為已報名人數
+            for item in training_list:
                 total_capacity = safe_int(item.get("numberOfPeopleSignUp", 0))
                 signed_up = safe_int(item.get("numberOfPeople", 0))
                 remaining = total_capacity - signed_up
                 
                 raw_date = str(item.get("trDate", "")).replace("-", "/")
-                organizer = item.get("organizerName", "未知單位")
 
                 is_valid_date = raw_date >= today_str
                 has_space = remaining > 0
-                
-                status_symbol = "✅ 可報名" if (is_valid_date and has_space) else "❌ 剔除"
-                print(f"[{idx}] {raw_date} | {organizer} | 已報:{signed_up}/{total_capacity} (剩{remaining}) -> {status_symbol}", flush=True)
 
                 if is_valid_date and has_space:
                     item["remaining"] = remaining
@@ -102,23 +98,32 @@ def check_training_courses():
                     item["signed_up"] = signed_up
                     available_courses.append(item)
 
-            print(f"---------------------------\n總計篩選出 {len(available_courses)} 筆可報名課程。\n", flush=True)
+            # 3. 根據觸發情境發送通知
+            is_manual_trigger = (GITHUB_EVENT_NAME in ["workflow_dispatch", "manual"])
 
-            # 3. 發送 LINE 通報
             if available_courses:
+                # 發現名額時發送詳細清單
                 msg = f"🚨【臺灣職安卡】發現可報名課程！\n\n"
                 for c in available_courses[:5]:
                     msg += f"📅 日期：{c.get('trDate', 'N/A')}\n"
                     msg += f"🏢 單位：{c.get('organizerName', 'N/A')}\n"
                     msg += f"📍 地點：{c.get('location', 'N/A')}\n"
-                    msg += f"🎟️ 剩餘名額：{c.get('remaining', 0)} / {c.get('total_capacity', 0)}\n"
+                    msg += f"🎟️ 剩餘名額：{c.get('remaining', 0)} 人 (已報名 {c.get('signed_up', 0)} / {c.get('total_capacity', 0)})\n"
                     msg += "------------------------------\n"
                 
                 msg += "\n🔗 報名連結：\nhttps://oshcard.osha.gov.tw/oscVue/OnlineApply/applylist"
-                
                 broadcast_line_message(msg)
+
+            elif is_manual_trigger:
+                # 手動觸發且目前沒課時，發送測試/啟動成功通知
+                msg = "⚙️【臺灣職安卡】監控系統已成功連線！\n\n" \
+                      "目前官網暫無可報名課程。\n" \
+                      "系統已進入背景輪詢模式（每 30 分鐘自動檢查），有釋出名額將會第一時間通知您！"
+                broadcast_line_message(msg)
+
             else:
-                print("目前無可報名課程，不發送通知。", flush=True)
+                # 排程觸發且沒課，靜默不發訊息
+                print("目前無可報名課程，自動排程不發送通知。", flush=True)
 
     except Exception as e:
         print(f"抓取課程資料時發生錯誤: {e}", flush=True)
