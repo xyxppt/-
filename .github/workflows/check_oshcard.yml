@@ -1,15 +1,13 @@
 name: Check OSH Card
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '17,47 * * * *' # 避開整點半點，改成每小時的 17 分與 47 分執行
+  workflow_dispatch: # 僅保留外部 API 觸發與手動按鈕，徹底擺脫 GitHub 遲到問題
 
 jobs:
   check-job:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # 授權機器人自動寫入與儲存記憶檔
 
     steps:
       - name: Check out repository
