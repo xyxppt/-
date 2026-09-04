@@ -1,9 +1,9 @@
 name: Check OSH Card
 
 on:
-  workflow_dispatch: # 支援手動點擊 Run workflow 觸發
+  workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *' # UTC 時間每 30 分鐘自動執行一次
+    - cron: '*/30 * * * *'
 
 jobs:
   check-job:
@@ -26,5 +26,6 @@ jobs:
       - name: Run course checker
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python check_oshcard.py
