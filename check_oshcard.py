@@ -174,17 +174,22 @@ def dump_raw_item(item):
 
 def parse_course(item):
     """
-    解析單一課程。numberOfPeople = 總限額，numberOfPeopleSignUp = 已報名人數。
-    若已報名人數大於總限額，代表資料矛盾，標記為 anomaly，不直接推播，
-    交由 Discord 診斷卡片人工確認，避免用猜測方式（例如自動互換欄位）造成誤判。
+    解析單一課程。numberOfPeople = 總限額，numberOfPeopleSignUp = 已報名/線上登記人數
+    （已與 onlineRegistrationSignup 欄位交叉驗證一致）。
+
+    已報名人數 > 總限額時，代表該課程已額滿甚至有候補，這是正常現象（不是資料錯誤），
+    剩餘名額直接視為 0，不再特別標記為「異常」。
+
+    onlineRegistrationOpen / onlineRegistrationCancel 是從實際 API 回傳資料中
+    確認存在的欄位（不是用猜的），用來判斷該課程線上報名是否仍開放、是否已取消。
     """
     total_capacity = safe_int(item.get("numberOfPeople", 0))
     signed_up = safe_int(item.get("numberOfPeopleSignUp", 0))
-    remaining = total_capacity - signed_up
+    remaining = max(0, total_capacity - signed_up)
+    is_overbooked = signed_up > total_capacity  # 純資訊用途，不影響是否推播
 
-    anomaly = None
-    if signed_up > total_capacity:
-        anomaly = f"已報名人數({signed_up}) > 總限額({total_capacity})，資料矛盾"
+    registration_open = str(item.get("onlineRegistrationOpen", "")).strip().upper()
+    registration_cancelled = str(item.get("onlineRegistrationCancel", "")).strip().upper()
 
     raw_date = str(item.get("trDate", "")).replace("-", "/")
     organizer = item.get("organizerName", "未知單位")
@@ -196,12 +201,23 @@ def parse_course(item):
         "total_capacity": total_capacity,
         "signed_up": signed_up,
         "remaining": remaining,
+        "is_overbooked": is_overbooked,
+        "registration_open": registration_open,
+        "registration_cancelled": registration_cancelled,
         "raw_date": raw_date,
         "organizer": organizer,
         "location": location,
         "key": course_key,
-        "anomaly": anomaly,
     }
+
+
+def is_registration_available(parsed):
+    """是否符合可報名條件：尚未取消，且線上報名為開放狀態（欄位缺值時預設放行，避免誤殺）"""
+    if parsed["registration_cancelled"] == "Y":
+        return False
+    if parsed["registration_open"] and parsed["registration_open"] != "Y":
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +230,14 @@ def check_training_courses():
     session = get_retry_session()
 
     line_status_str = "無新課程或名額釋出（LINE 靜音）"
-    anomalies = []
     ghost_courses = []
     real_notify_courses = []
     candidate_courses = []
     all_available = []
     current_active_keys = set()
     parse_errors = 0
+    overbooked_count = 0
+    registration_closed_count = 0
 
     try:
         # 1. 驗證 Token
@@ -256,16 +273,18 @@ def check_training_courses():
                 parse_errors += 1
                 continue
 
-            if parsed["anomaly"]:
-                anomalies.append({
-                    "key": parsed["key"],
-                    "reason": parsed["anomaly"],
-                    "raw": dump_raw_item(raw_item)
-                })
-                continue
-
+            # 1. 離島過濾（同時檢查單位名稱與地點，因為地點才是真正標示縣市的欄位）
             if any(kw in parsed["organizer"] or kw in parsed["location"] for kw in EXCLUDED_KEYWORDS):
                 continue
+
+            # 2. 報名狀態過濾（用已驗證存在的欄位，不是用猜的）
+            if not is_registration_available(parsed):
+                registration_closed_count += 1
+                continue
+
+            # 3. 額滿/候補只是單純沒名額，記錄統計即可，不需要特別標記為異常
+            if parsed["is_overbooked"]:
+                overbooked_count += 1
 
             if parsed["raw_date"] >= today_str and parsed["remaining"] > 0:
                 all_available.append(parsed)
@@ -298,7 +317,7 @@ def check_training_courses():
                             r_parsed = parse_course(r_raw)
                         except Exception:
                             continue
-                        if r_parsed["anomaly"]:
+                        if not is_registration_available(r_parsed):
                             continue
                         recheck_map[r_parsed["key"]] = r_parsed["remaining"]
 
@@ -350,7 +369,9 @@ def check_training_courses():
                 "value": (
                     f"開放報名中: {len(all_available)} 筆 | "
                     f"本次推播: {len(real_notify_courses)} 筆 | "
-                    f"解析失敗: {parse_errors} 筆"
+                    f"解析失敗: {parse_errors} 筆\n"
+                    f"額滿/候補中: {overbooked_count} 筆 | "
+                    f"報名未開放/已取消: {registration_closed_count} 筆"
                 ),
                 "inline": False
             }
@@ -387,18 +408,8 @@ def check_training_courses():
             vanished_summary = "\n".join(f"• 📉 {v}" for v in vanished_courses[:3])
             fields.append({"name": "📉 近期額滿/下架課程", "value": vanished_summary, "inline": False})
 
-        if anomalies:
-            anomaly_summary = "\n".join(f"• ⚠️ {a['key']} — {a['reason']}" for a in anomalies[:3])
-            fields.append({"name": "⚠️ 資料異常（未推播，需人工確認）", "value": anomaly_summary, "inline": False})
-            for a in anomalies[:2]:
-                fields.append({
-                    "name": f"🔍 異常原始資料 - {a['key']}",
-                    "value": f"```{a['raw']}```",
-                    "inline": False
-                })
-
         title = "🎯 發現真實可報名課程！" if real_notify_courses else "✅ 系統監控正常（無名額異動）"
-        color = 3447003 if real_notify_courses else (16753920 if (ghost_courses or anomalies) else 3066993)
+        color = 3447003 if real_notify_courses else (16753920 if ghost_courses else 3066993)
 
         send_discord_log(
             title=title,
