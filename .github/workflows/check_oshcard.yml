@@ -29,7 +29,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           # 想要在 Discord 看到真實推播課程的完整原始資料時，把這裡改成 "1"
-          DEBUG_MODE: "0"
+          DEBUG_MODE: "1"
           # 可用逗號分隔調整要排除的離島關鍵字，不需要改程式碼
           EXCLUDED_LOCATIONS: "澎湖,連江,馬祖,金門"
         run: python check_oshcard.py
