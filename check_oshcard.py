@@ -22,7 +22,7 @@ EXCLUDED_KEYWORDS = ["澎湖", "連江", "馬祖", "金門"]
 
 
 def load_and_clean_seen_courses():
-    """讀取記憶庫，自動清除過期課程（開課日早於今天）"""
+    """讀取記憶庫，自動清除開課日期早於今天的過期紀錄"""
     today_str = datetime.now().strftime("%Y/%m/%d")
     raw_dict = {}
 
@@ -39,11 +39,11 @@ def load_and_clean_seen_courses():
         except Exception as e:
             print(f"⚠️ 讀取記憶檔失敗: {e}", flush=True)
 
-    # 過濾過期課程
+    # 過濾過期課程（保留開課日 >= 今天）
     cleaned = {}
     for key, count in raw_dict.items():
         try:
-            course_date = key.split("_")[0]  # key 格式為 "日期_單位"
+            course_date = key.split("_")[0]  # key 格式為 "日期_單位_地點"
             if course_date >= today_str:
                 cleaned[key] = count
         except Exception:
@@ -54,7 +54,7 @@ def load_and_clean_seen_courses():
 
 
 def save_seen_courses(seen_dict):
-    """儲存記憶庫"""
+    """儲存記憶庫至 JSON 檔案"""
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(seen_dict, f, ensure_ascii=False, indent=2)
@@ -63,7 +63,7 @@ def save_seen_courses(seen_dict):
 
 
 def get_retry_session():
-    """建立具備自動重試機制的 HTTP Session"""
+    """建立具備自動重試機制（防網路抽風）的 HTTP Session"""
     session = requests.Session()
     session.verify = False
 
@@ -87,7 +87,7 @@ def get_retry_session():
 
 
 def send_discord_log(title, description, color=3066993, fields=None):
-    """發送 Discord 診斷卡片"""
+    """傳送 Discord 診斷卡片"""
     if not DISCORD_WEBHOOK_URL:
         return
     embed = {
@@ -106,7 +106,7 @@ def send_discord_log(title, description, color=3066993, fields=None):
 
 
 def broadcast_line_message(text_message):
-    """LINE Broadcast 推播"""
+    """發送 LINE Broadcast 推播"""
     if not LINE_CHANNEL_ACCESS_TOKEN:
         return False, "未設定 LINE Token"
     url = "https://api.line.me/v2/bot/message/broadcast"
@@ -125,6 +125,7 @@ def broadcast_line_message(text_message):
 
 
 def safe_int(value, default=0):
+    """安全轉換為整數"""
     try:
         return int(value)
     except (ValueError, TypeError):
@@ -132,7 +133,7 @@ def safe_int(value, default=0):
 
 
 def fetch_training_list(session):
-    """向官網 API 取得課程清單"""
+    """向官網 API 取得原始課程清單"""
     res = session.get(TRAINING_LIST_URL, timeout=10)
     json_data = res.json() if res.status_code == 200 else {}
     return json_data.get("trainingList", []) if isinstance(json_data, dict) else json_data
@@ -140,15 +141,27 @@ def fetch_training_list(session):
 
 def parse_course(item):
     """
-    解析單一課程，回傳標準化字典。
-    若課程不應被考慮（離島、已額滿、已取消等）則回傳 None。
+    解析單一課程，並進行嚴格過濾（離島、額滿、取消、報名時間不符）。
+    若通過則回傳標準化字典，否則回傳 None。
     """
-    # 基本欄位
+    # 1. 處理開課日期（自動轉換民國年）
     raw_date = str(item.get("trDate", "")).replace("-", "/")
-    # 處理民國年 (例如 115/09/04 -> 2026/09/04)
     parts = raw_date.split("/")
     if len(parts) == 3 and parts[0].isdigit() and len(parts[0]) < 4:
         raw_date = f"{int(parts[0]) + 1911}/{parts[1]}/{parts[2]}"
+
+    # 2. 處理報名起訖日期（也支援民國年轉換）【關鍵修復】
+    apply_start = str(item.get("applyStartDate", "")).replace("-", "/")
+    apply_end = str(item.get("applyEndDate", "")).replace("-", "/")
+
+    if apply_start:
+        parts_s = apply_start.split("/")
+        if len(parts_s) == 3 and parts_s[0].isdigit() and len(parts_s[0]) < 4:
+            apply_start = f"{int(parts_s[0]) + 1911}/{parts_s[1]}/{parts_s[2]}"
+    if apply_end:
+        parts_e = apply_end.split("/")
+        if len(parts_e) == 3 and parts_e[0].isdigit() and len(parts_e[0]) < 4:
+            apply_end = f"{int(parts_e[0]) + 1911}/{parts_e[1]}/{parts_e[2]}"
 
     organizer = item.get("organizerName", "未知單位")
     location = item.get("location", "")
@@ -156,20 +169,28 @@ def parse_course(item):
     is_full = str(item.get("isFull", "")).upper()
     is_cancel = str(item.get("isCancel", "")).upper()
 
-    # ---- 過濾條件 ----
-    # 1. 離島
+    today_str = datetime.now().strftime("%Y/%m/%d")
+
+    # ---- 過濾條件（與官網顯示邏輯完全一致） ----
+    # A. 離島過濾
     if any(kw in organizer or kw in location for kw in EXCLUDED_KEYWORDS):
         return None
 
-    # 2. 狀態已關閉／額滿
+    # B. 官網狀態標籤（已額滿 / 已取消）
     if is_full == "Y" or is_cancel == "Y":
         return None
     if "額滿" in apply_status or "截止" in apply_status:
         return None
 
-    # 3. 開課日期必須 >= 今天
-    today_str = datetime.now().strftime("%Y/%m/%d")
+    # C. 開課日期必須 >= 今天
     if raw_date < today_str:
+        return None
+
+    # D. 【重磅修復】報名時間必須包含「今天」
+    #    若報名尚未開始（applyStartDate > 今天）或已截止（applyEndDate < 今天），則跳過
+    if apply_start and apply_start > today_str:
+        return None
+    if apply_end and apply_end < today_str:
         return None
 
     # ---- 名額計算 ----
@@ -183,7 +204,7 @@ def parse_course(item):
     if remaining <= 0:
         return None
 
-    # ---- 建構標準物件 ----
+    # ---- 建構標準化物件 ----
     return {
         "raw_date": raw_date,
         "organizer": organizer,
@@ -191,16 +212,17 @@ def parse_course(item):
         "total_capacity": total,
         "signed_up": signed,
         "remaining": remaining,
-        # 強化唯一識別鍵：日期 + 單位 + 地點（避免同一天同一單位多班次混淆）
+        # 加入 location 使唯一識別 Key 更精準（防止同日同單位多班次混淆）
         "key": f"{raw_date}_{organizer}_{location}",
         "apply_status": apply_status,
         "is_full": is_full,
         "is_cancel": is_cancel,
-        "original_item": item  # 保留原始資料，以備不時之需
+        "notify_reason": ""  # 稍後由主程式填入
     }
 
 
 def check_training_courses():
+    """主監控流程"""
     current_time = time.strftime('%Y-%m-%d %H:%M:%S')
     seen_courses = load_and_clean_seen_courses()
     session = get_retry_session()
@@ -223,14 +245,13 @@ def check_training_courses():
         if not training_list:
             send_discord_log(
                 title="⚠️ 官網回傳空課程清單",
-                description=f"**執行時間**：{current_time}\n可能為 API 異常或 Token 失效",
-                color=16776960  # 黃色警示
+                description=f"**執行時間**：{current_time}\n可能為 API 異常或 Token 失效，請稍後確認。",
+                color=16776960  # 黃色
             )
             return
 
-        today_str = datetime.now().strftime("%Y/%m/%d")
-        all_available = []          # 本島可報名課程（用於統計）
-        candidate_courses = []      # 可能需通知的課程（尚未二次驗證）
+        all_available = []      # 本島可報名課程（用於統計）
+        candidate_courses = []  # 可能需通知的課程（需二次驗證）
 
         # 3. 解析每一筆課程
         for item in training_list:
@@ -240,7 +261,7 @@ def check_training_courses():
 
             all_available.append(course)
 
-            # 檢查是否為全新或名額增加
+            # 檢查是否為「全新課程」或「名額增加」
             prev = seen_courses.get(course["key"], 0)
             if prev == 0:
                 course["notify_reason"] = "🆕 全新課程釋出"
@@ -249,16 +270,16 @@ def check_training_courses():
                 course["notify_reason"] = f"🔄 退選釋出名額 (+{course['remaining'] - prev} 人)"
                 candidate_courses.append(course)
 
-        # 4. 雙重延遲驗證（防幽靈）
+        # 4. 雙重延遲驗證（防幽靈釋出 / 秒殺）
         real_notify = []
         ghost_courses = []
 
         if candidate_courses:
-            time.sleep(3)
+            time.sleep(3)  # 停頓 3 秒
             try:
                 recheck_list = fetch_training_list(session)
                 if recheck_list:
-                    # 建立二次驗證的快速對照表（key -> remaining）
+                    # 建立二次驗證快速對照表
                     recheck_map = {}
                     for r_item in recheck_list:
                         r_course = parse_course(r_item)
@@ -285,15 +306,15 @@ def check_training_courses():
                 for cand in candidate_courses:
                     seen_courses[cand["key"]] = cand["remaining"]
 
-        # 5. 額外檢查：記憶中有但官網已消失的課程（名額歸零）
+        # 5. 額外檢查：記憶中有但官網已消失的課程（名額歸零 / 下架）
         vanished = []
         active_keys = {c["key"] for c in all_available}
-        for key, prev_rem in seen_courses.items():
+        for key, prev_rem in list(seen_courses.items()):
             if prev_rem > 0 and key not in active_keys:
                 seen_courses[key] = 0
                 vanished.append(key)
 
-        # 6. 發送 LINE 推播（真實課程）
+        # 6. 發送 LINE 推播（僅當有真實課程時）
         if real_notify:
             line_msg = "🚨【臺灣職安卡】名額異動通報！\n\n"
             for c in real_notify[:5]:
@@ -310,7 +331,7 @@ def check_training_courses():
             success, status_desc = broadcast_line_message(line_msg)
             line_status_str = f"✅ 已推播 {len(real_notify)} 筆異動 ({status_desc})"
 
-        # 儲存記憶
+        # 儲存更新後的記憶庫
         save_seen_courses(seen_courses)
 
         # 7. 建構 Discord 診斷卡片
@@ -330,10 +351,10 @@ def check_training_courses():
 
         if ghost_courses:
             ghost_summary = "".join(
-                f"• 👻 **{c['raw_date']}** | {c['organizer']} (官網已標記額滿/隱藏)\n"
+                f"• 👻 **{c['raw_date']}** | {c['organizer']} (3秒內名額消失/官網隱藏)\n"
                 for c in ghost_courses
             )
-            fields.append({"name": "👻 濾除幽靈課程", "value": ghost_summary, "inline": False})
+            fields.append({"name": "👻 濾除幽靈/秒殺課程", "value": ghost_summary, "inline": False})
 
         if vanished:
             vanished_summary = "".join(f"• 📉 **{v}**\n" for v in vanished[:3])
@@ -350,7 +371,7 @@ def check_training_courses():
         send_discord_log(
             title="🚨 系統連線或解析失敗",
             description=f"**執行時間**：{current_time}\n**錯誤資訊**：`{str(e)}`",
-            color=15158332
+            color=15158332  # 紅色
         )
 
 
