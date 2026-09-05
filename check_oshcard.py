@@ -17,11 +17,10 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 SEEN_FILE = "seen_courses.json"
 
-# 優化 1：離島地區過濾關鍵字
 EXCLUDED_KEYWORDS = ["澎湖", "連江", "馬祖", "金門"]
 
 def load_and_clean_seen_courses():
-    """優化 3：讀取記憶庫並自動清除開課日期已過期的舊紀錄"""
+    """讀取記憶庫並自動清除開課日期已過期的舊紀錄"""
     today_str = datetime.now().strftime("%Y/%m/%d")
     raw_dict = {}
 
@@ -29,7 +28,6 @@ def load_and_clean_seen_courses():
         try:
             with open(SEEN_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # 兼容舊版 list 格式 (轉為 dict)
                 if isinstance(data, list):
                     for item in data:
                         raw_dict[item] = 0
@@ -38,7 +36,6 @@ def load_and_clean_seen_courses():
         except Exception as e:
             print(f"讀取記憶檔失敗: {e}", flush=True)
 
-    # 過濾過期資料 (key 格式為 'YYYY/MM/DD_單位')
     cleaned_dict = {}
     for key, count in raw_dict.items():
         try:
@@ -46,7 +43,7 @@ def load_and_clean_seen_courses():
             if course_date >= today_str:
                 cleaned_dict[key] = count
         except Exception:
-            cleaned_dict[key] = count # 解析失敗則保留
+            cleaned_dict[key] = count
 
     return cleaned_dict
 
@@ -59,13 +56,13 @@ def save_seen_courses(seen_dict):
         print(f"寫入記憶檔失敗: {e}", flush=True)
 
 def get_retry_session():
-    """優化 5：建立具備自動重試功能的 HTTP Session (防範政府網站抽風)"""
+    """建立具備自動重試功能的 HTTP Session"""
     session = requests.Session()
     session.verify = False
     
     retries = Retry(
-        total=3,                # 最多重試 3 次
-        backoff_factor=2,       # 間隔 2s, 4s, 8s 重試
+        total=3,
+        backoff_factor=2,
         status_forcelist=[500, 502, 503, 504],
         raise_on_status=False
     )
@@ -123,6 +120,12 @@ def safe_int(value, default=0):
     except (ValueError, TypeError):
         return default
 
+def fetch_training_list(session):
+    """向官網抓取原始課程清單"""
+    res = session.get(TRAINING_LIST_URL, timeout=10)
+    json_data = res.json() if res.status_code == 200 else {}
+    return json_data.get("trainingList", []) if isinstance(json_data, dict) else json_data
+
 def check_training_courses():
     current_time = time.strftime('%Y-%m-%d %H:%M:%S')
     seen_courses = load_and_clean_seen_courses()
@@ -141,14 +144,13 @@ def check_training_courses():
                     token = f"Bearer {token}"
                 session.headers.update({"Authorization": token})
 
-        # 2. 抓取官網全網課程
-        res = session.get(TRAINING_LIST_URL, timeout=10)
-        json_data = res.json() if res.status_code == 200 else {}
-        training_list = json_data.get("trainingList", []) if isinstance(json_data, dict) else json_data
-
+        # 2. 第一次抓取全網課程
+        training_list = fetch_training_list(session)
         today_str = datetime.now().strftime("%Y/%m/%d")
+        
         all_available = []
-        notify_courses = []
+        candidate_courses = []
+        current_active_keys = set()
 
         for item in training_list:
             total_capacity = safe_int(item.get("numberOfPeopleSignUp", 0))
@@ -158,7 +160,7 @@ def check_training_courses():
             organizer = item.get("organizerName", "未知單位")
             location = item.get("location", "")
 
-            # 優化 1：過濾離島（連江、澎湖、馬祖、金門）
+            # 過濾離島
             if any(kw in organizer or kw in location for kw in EXCLUDED_KEYWORDS):
                 continue
 
@@ -170,52 +172,90 @@ def check_training_courses():
                 item["signed_up"] = signed_up
                 item["key"] = course_key
                 all_available.append(item)
+                current_active_keys.add(course_key)
 
-                # 優化 2：動態名額遞補追蹤（新課程 或 舊課程名額變多）
-                prev_remaining = seen_courses.get(course_key)
-                if prev_remaining is None:
+                prev_remaining = seen_courses.get(course_key, 0)
+                if prev_remaining == 0:
                     item["notify_reason"] = "🆕 全新課程釋出"
-                    notify_courses.append(item)
+                    candidate_courses.append(item)
                 elif remaining > prev_remaining:
                     item["notify_reason"] = f"🔄 有人退選釋出名額 (+{remaining - prev_remaining} 人)"
-                    notify_courses.append(item)
+                    candidate_courses.append(item)
 
-                # 更新記憶檔案裡的名額紀錄
-                seen_courses[course_key] = remaining
+        # 追蹤已額滿或被下架的舊課程
+        vanished_courses = []
+        for k, prev_rem in list(seen_courses.items()):
+            if prev_rem > 0 and k not in current_active_keys:
+                seen_courses[k] = 0  # 註記為已額滿 / 下架
+                vanished_courses.append(k)
 
-        # 3. 觸發 LINE 通知
-        if notify_courses:
+        # 3. 二次延遲雙重驗證（防止幽靈釋出/瞬間閃退）
+        real_notify_courses = []
+        ghost_courses = []
+
+        if candidate_courses:
+            time.sleep(3)  # 停頓 3 秒後進行第二次複查
+            recheck_list = fetch_training_list(session)
+            
+            recheck_map = {}
+            for r_item in recheck_list:
+                r_tot = safe_int(r_item.get("numberOfPeopleSignUp", 0))
+                r_sig = safe_int(r_item.get("numberOfPeople", 0))
+                r_rem = r_tot - r_sig
+                r_date = str(r_item.get("trDate", "")).replace("-", "/")
+                r_org = r_item.get("organizerName", "未知單位")
+                recheck_map[f"{r_date}_{r_org}"] = r_rem
+
+            for cand in candidate_courses:
+                ckey = cand["key"]
+                rc_rem = recheck_map.get(ckey, 0)
+                if rc_rem > 0:
+                    real_notify_courses.append(cand)
+                    seen_courses[ckey] = rc_rem
+                else:
+                    # 3秒內消失者視為幽靈釋出，不發送 LINE
+                    ghost_courses.append(cand)
+                    seen_courses[ckey] = 0
+
+        # 4. 推播真實名額至 LINE
+        if real_notify_courses:
             line_msg = f"🚨【臺灣職安卡】名額異動通報！\n\n"
-            for c in notify_courses[:5]:
+            for c in real_notify_courses[:5]:
                 line_msg += f"📌 狀態：{c['notify_reason']}\n"
                 line_msg += f"📅 日期：{c.get('trDate', 'N/A')}\n"
                 line_msg += f"🏢 單位：{c.get('organizerName', 'N/A')}\n"
                 line_msg += f"📍 地點：{c.get('location', 'N/A')}\n"
                 line_msg += f"🎟️ 剩餘名額：{c.get('remaining', 0)} 人 (已報名 {c.get('signed_up', 0)} / {c.get('total_capacity', 0)})\n"
                 line_msg += "------------------------------\n"
-                
             line_msg += "\n🔗 報名連結：\nhttps://oshcard.osha.gov.tw/oscVue/OnlineApply/applylist"
             
             success, status_desc = broadcast_line_message(line_msg)
-            line_status_str = f"✅ 已推播 {len(notify_courses)} 筆異動至 LINE ({status_desc})"
+            line_status_str = f"✅ 已推播 {len(real_notify_courses)} 筆真實異動至 LINE ({status_desc})"
 
-        # 寫入更新與清理後的記憶檔
         save_seen_courses(seen_courses)
 
-        # 4. 回傳 Discord 診斷
+        # 5. Discord 詳細回報
         fields = [
             {"name": "💬 LINE 推播狀態", "value": line_status_str, "inline": False},
-            {"name": "📊 官網課程統計 (本島)", "value": f"開放報名中: {len(all_available)} 筆 | 本次異動通報: {len(notify_courses)} 筆", "inline": False}
+            {"name": "📊 官網課程統計 (本島)", "value": f"開放報名中: {len(all_available)} 筆 | 本次推播: {len(real_notify_courses)} 筆", "inline": False}
         ]
 
-        if notify_courses:
-            summary = "".join([f"• **[{c['notify_reason']}] {c.get('trDate')}** | {c.get('organizerName')} (剩 {c.get('remaining')} 人)\n" for c in notify_courses[:3]])
+        if real_notify_courses:
+            summary = "".join([f"• **[{c['notify_reason']}] {c.get('trDate')}** | {c.get('organizerName')} (剩 {c.get('remaining')} 人)\n" for c in real_notify_courses[:3]])
             fields.append({"name": "🎯 通報摘要", "value": summary, "inline": False})
 
+        if ghost_courses:
+            ghost_summary = "".join([f"• 👻 **{c.get('trDate')}** | {c.get('organizerName')} (出現後 3 秒內消失)\n" for c in ghost_courses])
+            fields.append({"name": "👻 攔截到瞬間下架/幽靈釋出", "value": ghost_summary, "inline": False})
+
+        if vanished_courses:
+            vanished_summary = "".join([f"• 📉 **{v.replace('_', ' ')}**\n" for v in vanished_courses[:3]])
+            fields.append({"name": "📉 近期額滿/下架課程", "value": vanished_summary, "inline": False})
+
         send_discord_log(
-            title="🎯 發現新課程或退選釋出名額！" if notify_courses else "✅ 系統監控正常（無名額異動）",
+            title="🎯 發現真實可報名課程！" if real_notify_courses else "✅ 系統監控正常（無名額異動）",
             description=f"**執行時間**：{current_time}",
-            color=3447003 if notify_courses else 3066993,
+            color=3447003 if real_notify_courses else (16753920 if ghost_courses else 3066993),
             fields=fields
         )
 
