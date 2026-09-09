@@ -236,7 +236,7 @@ def check_training_courses():
     all_available = []
     current_active_keys = set()
     parse_errors = 0
-    overbooked_count = 0
+    overbooked_courses = []
     registration_closed_count = 0
 
     try:
@@ -282,9 +282,9 @@ def check_training_courses():
                 registration_closed_count += 1
                 continue
 
-            # 3. 額滿/候補只是單純沒名額，記錄統計即可，不需要特別標記為異常
+            # 3. 額滿/候補只是單純沒名額，記錄明細方便日後比對是否誤判
             if parsed["is_overbooked"]:
-                overbooked_count += 1
+                overbooked_courses.append(parsed)
 
             if parsed["raw_date"] >= today_str and parsed["remaining"] > 0:
                 all_available.append(parsed)
@@ -370,7 +370,7 @@ def check_training_courses():
                     f"開放報名中: {len(all_available)} 筆 | "
                     f"本次推播: {len(real_notify_courses)} 筆 | "
                     f"解析失敗: {parse_errors} 筆\n"
-                    f"額滿/候補中: {overbooked_count} 筆 | "
+                    f"額滿/候補中: {len(overbooked_courses)} 筆 | "
                     f"報名未開放/已取消: {registration_closed_count} 筆"
                 ),
                 "inline": False
@@ -407,6 +407,28 @@ def check_training_courses():
         if vanished_courses:
             vanished_summary = "\n".join(f"• 📉 {v}" for v in vanished_courses[:3])
             fields.append({"name": "📉 近期額滿/下架課程", "value": vanished_summary, "inline": False})
+
+        if overbooked_courses:
+            # 這裡是最容易誤判的地方：若官網實際顯示某課程還可報名，
+            # 但系統判定它已額滿/候補，代表 numberOfPeople / numberOfPeopleSignUp
+            # 這組欄位對這筆課程的意義可能跟預期不同，需要用原始資料核對。
+            overbooked_summary = "\n".join(
+                f"• {c['raw_date']} | {c['organizer']} "
+                f"(已報名 {c['signed_up']} / 總額 {c['total_capacity']})"
+                for c in overbooked_courses[:8]
+            )
+            fields.append({
+                "name": "🪑 額滿/候補課程明細（如與官網不符，代表誤判）",
+                "value": overbooked_summary,
+                "inline": False
+            })
+            # 一律附上前 2 筆原始資料（不受 DEBUG_MODE 限制），因為這裡最需要核對真實欄位
+            for c in overbooked_courses[:2]:
+                fields.append({
+                    "name": f"🔍 原始資料 - {c['organizer']} ({c['raw_date']})",
+                    "value": f"```{dump_raw_item(c['raw_item'])}```",
+                    "inline": False
+                })
 
         title = "🎯 發現真實可報名課程！" if real_notify_courses else "✅ 系統監控正常（無名額異動）"
         color = 3447003 if real_notify_courses else (16753920 if ghost_courses else 3066993)
