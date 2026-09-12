@@ -2,6 +2,7 @@ import os
 import json
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import urllib3
@@ -45,7 +46,8 @@ RAW_FIELD_DUMP_LIMIT = 900
 
 # API 第一次抓取後，如果發現新課程 / 名額增加，
 # 等待幾秒再重新抓取一次確認。
-RECHECK_DELAY_SECONDS = 3
+RECHECK_DELAY_SECONDS = int(os.getenv("RECHECK_DELAY_SECONDS", "5"))
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
 # ============================================================================
@@ -69,7 +71,7 @@ def load_and_clean_seen_courses():
     同時清除已經過期的課程紀錄。
     """
 
-    today_str = datetime.now().strftime("%Y/%m/%d")
+    today_str = datetime.now(TAIPEI_TZ).strftime("%Y/%m/%d")
     raw_dict = {}
 
     if os.path.exists(SEEN_FILE):
@@ -190,7 +192,7 @@ def normalize_date(value):
 
 
 def get_current_time_string():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def get_discord_timestamp():
@@ -217,8 +219,8 @@ def get_retry_session():
 
     session = requests.Session()
 
-    # 官網目前憑證環境可能需要這個設定。
-    session.verify = False
+    # 正常驗證 HTTPS 憑證；若官網憑證異常，應讓錯誤浮現而不是靜默忽略。
+    session.verify = True
 
     retries = Retry(
         total=4,
@@ -512,23 +514,27 @@ def parse_course(item):
     # 名額
     # ------------------------------------------------------------------------
 
-    total_capacity = safe_int(
-        item.get("numberOfPeopleSignUp"),
-        0
+    raw_total_capacity = item.get("numberOfPeopleSignUp")
+    raw_signed_up = item.get("numberOfPeople")
+
+    total_capacity = safe_int(raw_total_capacity, -1)
+    signed_up = safe_int(raw_signed_up, -1)
+
+    capacity_data_valid = (
+        total_capacity >= 0
+        and signed_up >= 0
+        and signed_up <= total_capacity
     )
 
-    signed_up = safe_int(
-        item.get("numberOfPeople"),
-        0
-    )
-
-    remaining = max(
-        0,
+    remaining = (
         total_capacity - signed_up
+        if capacity_data_valid
+        else None
     )
 
     is_overbooked = (
-        total_capacity > 0
+        total_capacity >= 0
+        and signed_up >= 0
         and signed_up > total_capacity
     )
 
@@ -586,6 +592,7 @@ def parse_course(item):
         "signed_up": signed_up,
         "remaining": remaining,
 
+        "capacity_data_valid": capacity_data_valid,
         "is_overbooked": is_overbooked,
 
         "registration_open": registration_open,
@@ -637,10 +644,8 @@ def is_registration_available(parsed):
     if parsed["registration_cancelled"] == "Y":
         return False
 
-    if (
-        parsed["registration_open"]
-        and parsed["registration_open"] != "Y"
-    ):
+    # 線上報名欄位必須明確為 Y，空白/未知不推播。
+    if parsed["registration_open"] != "Y":
         return False
 
     return True
@@ -677,7 +682,10 @@ def is_open_and_available(parsed, today_str):
     if not is_course_date_active(parsed, today_str):
         return False
 
-    if parsed["remaining"] <= 0:
+    if not parsed.get("capacity_data_valid", False):
+        return False
+
+    if parsed["remaining"] is None or parsed["remaining"] <= 0:
         return False
 
     return True
@@ -745,6 +753,8 @@ def check_training_courses():
     registration_closed_count = 0
     expired_or_full_count = 0
     excluded_count = 0
+    invalid_capacity_count = 0
+    state_debug_lines = []
 
     auth_warning = None
 
@@ -803,7 +813,7 @@ def check_training_courses():
             flush=True
         )
 
-        today_str = datetime.now().strftime("%Y/%m/%d")
+        today_str = datetime.now(TAIPEI_TZ).strftime("%Y/%m/%d")
 
         # ====================================================================
         # 4. 診斷標題
@@ -898,6 +908,14 @@ def check_training_courses():
             # D. 日期 + 名額
             # ----------------------------------------------------------------
 
+            if not parsed.get("capacity_data_valid", False):
+                invalid_capacity_count += 1
+                category = "名額資料異常（不推播）"
+                diagnostic_lines.append(
+                    diagnostic_line(parsed, category)
+                )
+                continue
+
             if is_open_and_available(
                 parsed,
                 today_str
@@ -929,6 +947,10 @@ def check_training_courses():
                         "🆕 全新課程釋出"
                     )
 
+                    state_debug_lines.append(
+                        f"{parsed['key']}: previous={previous_remaining}, "
+                        f"current={parsed['remaining']}, reason=NEW"
+                    )
                     candidate_courses.append(parsed)
 
                 # ------------------------------------------------------------
@@ -946,6 +968,10 @@ def check_training_courses():
                         f"🔄 名額增加 (+{increase} 人)"
                     )
 
+                    state_debug_lines.append(
+                        f"{parsed['key']}: previous={previous_remaining}, "
+                        f"current={parsed['remaining']}, reason=INCREASE"
+                    )
                     candidate_courses.append(parsed)
 
             else:
@@ -964,6 +990,19 @@ def check_training_courses():
         # ====================================================================
         # 6. GitHub Actions 完整診斷
         # ====================================================================
+
+        print(
+            f"===== 記憶庫診斷：共 {len(seen_courses)} 筆 =====",
+            flush=True
+        )
+        if "C11510011" in seen_courses:
+            print(
+                f"🔎 C11510011 記憶值 = {seen_courses['C11510011']} "
+                f"(本次 API 值將在下方診斷)",
+                flush=True
+            )
+        else:
+            print("🔎 C11510011 不在本次 runner 的 seen_courses.json", flush=True)
 
         print(
             "===== 課程診斷明細 =====",
@@ -1068,7 +1107,10 @@ def check_training_courses():
                         ):
                             continue
 
-                        if r_parsed["remaining"] <= 0:
+                        if not r_parsed.get("capacity_data_valid", False):
+                            continue
+
+                        if r_parsed["remaining"] is None or r_parsed["remaining"] <= 0:
                             continue
 
                         recheck_map[
@@ -1162,8 +1204,8 @@ def check_training_courses():
                 # ------------------------------------------------------------
                 # 第二次 API 失敗
                 #
-                # 不因為第二次 API 暫時故障而漏掉真正課程。
-                # 因此採用第一次結果。
+                # 安全策略：第二次驗證失敗時絕不 LINE 推播。
+                # 第一次成功 ≠ 已確認課程仍可報名，避免幽靈通知。
                 # ------------------------------------------------------------
 
                 print(
@@ -1172,19 +1214,9 @@ def check_training_courses():
                 )
 
                 print(
-                    "ℹ️ 將信任第一次成功抓取結果，避免漏報。",
+                    "🛑 不推播第一次結果；本次候選保留原記憶值，等待下一輪重新確認。",
                     flush=True
                 )
-
-                real_notify_courses = (
-                    candidate_courses
-                )
-
-                for candidate in candidate_courses:
-
-                    seen_courses[
-                        candidate["key"]
-                    ] = candidate["remaining"]
 
         # ====================================================================
         # 9. LINE 推播
@@ -1297,6 +1329,8 @@ def check_training_courses():
                 f"{registration_closed_count} 筆\n"
                 f"過期或無名額："
                 f"{expired_or_full_count} 筆\n"
+                f"名額資料異常："
+                f"{invalid_capacity_count} 筆\n"
                 f"離島已過濾："
                 f"{excluded_count} 筆"
             ),
@@ -1312,6 +1346,17 @@ def check_training_courses():
             fields.append({
                 "name": "⚠️ Auth Token",
                 "value": auth_warning,
+                "inline": False
+            })
+
+        # --------------------------------------------------------------------
+        # 記憶庫候選診斷
+        # --------------------------------------------------------------------
+
+        if state_debug_lines:
+            fields.append({
+                "name": "🧠 記憶庫異動判定",
+                "value": "\n".join(state_debug_lines[:12]),
                 "inline": False
             })
 
